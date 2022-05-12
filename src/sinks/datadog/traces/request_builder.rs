@@ -12,7 +12,7 @@ use super::{
 use crate::{
     event::{Event, TraceEvent, Value},
     sinks::{
-        datadog::traces::sink::PartitionKey,
+        datadog::traces::{sink::PartitionKey, stats},
         util::{Compression, Compressor, IncrementalRequestBuilder},
     },
 };
@@ -92,54 +92,42 @@ impl IncrementalRequestBuilder<(PartitionKey, Vec<Event>)> for DatadogTracesRequ
         &mut self,
         input: (PartitionKey, Vec<Event>),
     ) -> Vec<Result<(Self::Metadata, Self::Payload), Self::Error>> {
-        let (mut key, events) = input;
+        let (key, events) = input;
         let mut results = Vec::new();
         let n = events.len();
-        match key.endpoint {
-            DatadogTracesEndpoint::APMStats => {
-                results.push(Err(RequestBuilderError::UnsupportedEndpoint {
-                    reason: "APM stats are not yet supported.".into(),
-                    dropped_events: n as u64,
-                }))
-            }
-            DatadogTracesEndpoint::Traces => {
-                let traces_event = events
-                    .into_iter()
-                    .filter_map(|e| e.try_into_trace())
-                    .collect();
-                self.trace_encoder
-                    .encode_trace(&key, traces_event)
-                    .into_iter()
-                    .for_each(|r| match r {
-                        Ok((payload, mut processed)) => {
-                            let uncompressed_size = payload.len();
-                            let metadata = RequestMetadata {
-                                api_key: key
-                                    .api_key
-                                    .take()
-                                    .unwrap_or_else(|| Arc::clone(&self.api_key)),
-                                batch_size: n,
-                                lang: key.lang.clone(),
-                                endpoint: key.endpoint,
-                                finalizers: processed.take_finalizers(),
-                                uncompressed_size,
-                            };
-                            let mut compressor = Compressor::from(self.compression);
-                            match compressor.write_all(&payload) {
-                                Ok(()) => {
-                                    results.push(Ok((metadata, compressor.into_inner().freeze())))
-                                }
-                                Err(e) => results.push(Err(RequestBuilderError::FailedToEncode {
-                                    message: "Payload compression failed.",
-                                    reason: e.to_string(),
-                                    dropped_events: n as u64,
-                                })),
-                            }
-                        }
-                        Err(err) => results.push(Err(RequestBuilderError::FailedToEncode {
-                            message: err.parts().0,
-                            reason: err.parts().1.into(),
-                            dropped_events: err.parts().2,
+        let traces_event = events
+            .into_iter()
+            .filter_map(|e| e.try_into_trace())
+            .collect::<Vec<TraceEvent>>();
+
+        results.push(get_apm_stats_request(
+            &key,
+            &traces_event,
+            self.compression,
+            &self.api_key,
+        ));
+
+        self.trace_encoder
+            .encode_trace(&key, traces_event)
+            .into_iter()
+            .for_each(|r| match r {
+                Ok((payload, mut processed)) => {
+                    let metadata = RequestMetadata {
+                        api_key: key
+                            .api_key
+                            .clone()
+                            .unwrap_or_else(|| Arc::clone(&self.api_key)),
+                        batch_size: n,
+                        endpoint: DatadogTracesEndpoint::Traces,
+                        finalizers: processed.take_finalizers(),
+                    };
+                    let mut compressor = Compressor::from(self.compression);
+                    match compressor.write_all(&payload) {
+                        Ok(()) => results.push(Ok((metadata, compressor.into_inner().freeze()))),
+                        Err(e) => results.push(Err(RequestBuilderError::FailedToEncode {
+                            message: "Payload compression failed.",
+                            reason: e.to_string(),
+                            dropped_events: n as u64,
                         })),
                     })
             }
@@ -359,5 +347,36 @@ impl DatadogTracesEncoder {
             meta,
             metrics,
         }
+    }
+}
+
+fn get_apm_stats_request(
+    key: &PartitionKey,
+    events: &[TraceEvent],
+    compression: Compression,
+    default_api_key: &Arc<str>,
+) -> Result<(RequestMetadata, Bytes), RequestBuilderError> {
+    // let mut encoded_payloads = Vec::new();
+    let payload = stats::compute_apm_stats(key, events);
+    let encoded_payload = payload.encode_to_vec();
+    let uncompressed_size = encoded_payload.len();
+    let metadata = RequestMetadata {
+        api_key: key
+            .api_key
+            .clone()
+            .unwrap_or_else(|| Arc::clone(default_api_key)),
+        batch_size: 0,
+        endpoint: DatadogTracesEndpoint::APMStats,
+        finalizers: EventFinalizers::default(),
+        uncompressed_size,
+    };
+    let mut compressor = Compressor::from(compression);
+    match compressor.write_all(&encoded_payload) {
+        Ok(()) => Ok((metadata, compressor.into_inner().freeze())),
+        Err(e) => Err(RequestBuilderError::FailedToEncode {
+            message: "APM stats payload compression failed.",
+            reason: e.to_string(),
+            dropped_events: 0,
+        }),
     }
 }
