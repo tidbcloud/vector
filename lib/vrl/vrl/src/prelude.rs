@@ -26,8 +26,8 @@ pub use compiler::function::{
 };
 // commonly used macros
 pub use compiler::{
-    bench_function, expr, expression::FunctionArgument, func_args, map, test_function,
-    test_type_def, type_def, value, vm::VmArgumentList,
+    bench_function, expr, func_args, function::ResolvedArgument, map, test_function, test_type_def,
+    type_def, value, vm::VmArgumentList,
 };
 pub use diagnostic::DiagnosticError;
 pub use indoc::indoc;

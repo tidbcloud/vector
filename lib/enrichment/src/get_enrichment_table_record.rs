@@ -134,7 +134,7 @@ impl Function for GetEnrichmentTableRecord {
 
     fn compile_argument(
         &self,
-        args: &[(&'static str, Option<FunctionArgument>)],
+        args: &[(&'static str, Option<ResolvedArgument>)],
         ctx: &mut FunctionCompileContext,
         name: &str,
         expr: Option<&expression::Expr>,

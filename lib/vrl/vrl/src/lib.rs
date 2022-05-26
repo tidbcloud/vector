@@ -13,6 +13,7 @@ pub use compiler::{
     function, llvm, state, value, vm::Vm, Context, Expression, Function, Program, Target, Value,
     VrlRuntime,
 };
+pub use core;
 pub use diagnostic;
 pub use runtime::{Runtime, RuntimeResult, Terminate};
 

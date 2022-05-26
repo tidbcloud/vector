@@ -5809,6 +5809,7 @@ dependencies = [
 name = "precompiled-sys"
 version = "0.0.0"
 dependencies = [
+ "bytes 1.1.0",
  "vrl-core",
 ]
 

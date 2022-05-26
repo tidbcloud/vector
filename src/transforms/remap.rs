@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::{self, Read},
     path::PathBuf,
@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::sync::Arc;
-use value::Kind;
+use value::{Kind, Value};
 use vector_common::TimeZone;
 use vrl::{
     diagnostic::{Formatter, Note},
@@ -54,6 +54,7 @@ impl RemapConfig {
     ) -> Result<(
         vrl::Program,
         Vec<Box<dyn vrl::Function>>,
+        vrl::state::LocalEnv,
         vrl::state::ExternalEnv,
     )> {
         let source = match (&self.source, &self.file) {
@@ -75,17 +76,18 @@ impl RemapConfig {
         functions.append(&mut enrichment::vrl_functions());
         functions.append(&mut vector_vrl_functions::vrl_functions());
 
-        let mut state = vrl::state::ExternalEnv::new_with_kind(merged_schema_definition.into());
-        state.set_external_context(enrichment_tables);
+        let mut external_env =
+            vrl::state::ExternalEnv::new_with_kind(merged_schema_definition.into());
+        external_env.set_external_context(enrichment_tables);
 
-        vrl::compile_with_state(&source, &functions, &mut state)
+        vrl::compile_with_state(&source, &functions, &mut external_env)
             .map_err(|diagnostics| {
                 Formatter::new(&source, diagnostics)
                     .colored()
                     .to_string()
                     .into()
             })
-            .map(|(program, _)| (program, functions, state))
+            .map(|(program, local_env)| (program, functions, local_env, external_env))
     }
 }
 
@@ -108,6 +110,10 @@ impl TransformConfig for RemapConfig {
                 let remap = Remap::new_vm(self.clone(), context)?;
                 Ok(Transform::synchronous(remap))
             }
+            VrlRuntime::Llvm => {
+                let remap = Remap::new_llvm(self.clone(), context)?;
+                Ok(Transform::synchronous(remap))
+            }
         }
     }
 
@@ -127,7 +133,7 @@ impl TransformConfig for RemapConfig {
                 merged_definition.clone(),
             )
             .ok()
-            .and_then(|(_, _, state)| state.target_kind().cloned())
+            .and_then(|(_, _, _, state)| state.target_kind().cloned())
             .and_then(Kind::into_object)
             .map(Into::into)
             .unwrap_or_else(schema::Definition::empty);
@@ -194,6 +200,49 @@ pub trait VrlRunner {
 }
 
 #[derive(Debug)]
+pub struct LlvmRunner {
+    #[allow(dead_code)]
+    library: Arc<vrl::llvm::Library<'static>>,
+    execute: usize,
+}
+
+unsafe impl Send for LlvmRunner {}
+
+unsafe impl Sync for LlvmRunner {}
+
+impl Clone for LlvmRunner {
+    fn clone(&self) -> Self {
+        Self {
+            library: Arc::clone(&self.library),
+            execute: self.execute,
+        }
+    }
+}
+
+impl VrlRunner for LlvmRunner {
+    fn run(
+        &mut self,
+        target: &mut VrlTarget,
+        _: &Program,
+        timezone: &TimeZone,
+    ) -> std::result::Result<vrl::Value, Terminate> {
+        let mut context = vrl::core::Context { target, timezone };
+        let mut result = Ok(Value::Null);
+        let execute = unsafe {
+            std::mem::transmute::<
+                _,
+                for<'a> unsafe fn(&'a mut vrl::core::Context<'a>, &'a mut vrl::core::Resolved),
+            >(self.execute)
+        };
+        unsafe { execute(&mut context, &mut result) };
+        result.map_err(|error| match error {
+            ExpressionError::Abort { .. } => Terminate::Abort(error),
+            error @ ExpressionError::Error { .. } => Terminate::Error(error),
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct VmRunner {
     runtime: Runtime,
     vm: Arc<Vm>,
@@ -245,15 +294,50 @@ impl VrlRunner for AstRunner {
     }
 }
 
+impl Remap<LlvmRunner> {
+    pub fn new_llvm(config: RemapConfig, context: &TransformContext) -> crate::Result<Self> {
+        let (program, _, mut local_env, mut external_env) = config.compile_vrl_program(
+            context.enrichment_tables.clone(),
+            context.merged_schema_definition.clone(),
+        )?;
+
+        let builder = vrl::llvm::Compiler::new().unwrap();
+        let mut symbols = HashMap::new();
+        symbols.insert("vrl_fn_downcase", vrl_stdlib::vrl_fn_downcase as usize);
+        symbols.insert(
+            "vrl_fn_starts_with",
+            vrl_stdlib::vrl_fn_starts_with as usize,
+        );
+        symbols.insert("vrl_fn_string", vrl_stdlib::vrl_fn_string as usize);
+        symbols.insert("vrl_fn_upcase", vrl_stdlib::vrl_fn_upcase as usize);
+        let library = builder
+            .compile(
+                (&mut local_env, &mut external_env),
+                &program,
+                vrl_stdlib::all(),
+                symbols,
+            )
+            .unwrap();
+        let execute = library.get_function_address().unwrap() as usize;
+
+        let runner = LlvmRunner {
+            library: Arc::new(library),
+            execute: execute,
+        };
+
+        Self::new(config, context, program, runner)
+    }
+}
+
 impl Remap<VmRunner> {
     pub fn new_vm(config: RemapConfig, context: &TransformContext) -> crate::Result<Self> {
-        let (program, functions, mut state) = config.compile_vrl_program(
+        let (program, functions, _, mut external_env) = config.compile_vrl_program(
             context.enrichment_tables.clone(),
             context.merged_schema_definition.clone(),
         )?;
 
         let runtime = Runtime::default();
-        let vm = runtime.compile(functions, &program, &mut state)?;
+        let vm = runtime.compile(functions, &program, &mut external_env)?;
         let runner = VmRunner {
             runtime,
             vm: Arc::new(vm),
@@ -265,7 +349,7 @@ impl Remap<VmRunner> {
 
 impl Remap<AstRunner> {
     pub fn new_ast(config: RemapConfig, context: &TransformContext) -> crate::Result<Self> {
-        let (program, _, _) = config.compile_vrl_program(
+        let (program, _, _, _) = config.compile_vrl_program(
             context.enrichment_tables.clone(),
             context.merged_schema_definition.clone(),
         )?;
