@@ -11,9 +11,7 @@ struct Source {
     code: &'static str,
 }
 
-use vrl_stdlib::{
-    uuid_v4, vrl_fn_downcase as downcase, vrl_fn_string as string, vrl_fn_upcase as upcase,
-};
+use vrl_stdlib::{uuid_v4, vrl_fn_downcase as downcase, vrl_fn_upcase as upcase};
 
 #[inline(never)]
 #[no_mangle]
@@ -26,7 +24,44 @@ extern "C" {
     fn vrl_fn_upcase(value: *mut Resolved, resolved: *mut Resolved);
 }
 
-static SOURCES: [Source; 13] = [
+static SOURCES: [Source; 15] = [
+    Source {
+        name: "starts_with",
+        code: indoc! {r#"
+            status = string(.foo) ?? ""
+            .status = starts_with("a", status, true)
+        "#},
+    },
+    Source {
+        name: "pipelines",
+        code: indoc! {r#"
+            status = string(.custom.http.status_category) ?? string(.custom.level) ?? ""
+            status = downcase(status)
+            if status == "" {
+                .status = 6
+            } else {
+                if starts_with(status, "f", true) || starts_with(status, "emerg", true) {
+                    .status = 0
+                } else if starts_with(status, "a", true) {
+                    .status = 1
+                } else if starts_with(status, "c", true) {
+                    .status = 2
+                } else if starts_with(status, "e", true) {
+                    .status = 3
+                } else if starts_with(status, "w", true) {
+                    .status = 4
+                } else if starts_with(status, "n", true) {
+                    .status = 5
+                } else if starts_with(status, "i", true) {
+                    .status = 6
+                } else if starts_with(status, "d", true) || starts_with(status, "trace", true) || starts_with(status, "verbose", true) {
+                    .status = 7
+                } else if starts_with(status, "o", true) || starts_with(status, "s", true) || status == "ok" || status == "success" {
+                    .status = 8
+                }
+            }
+        "#},
+    },
     Source {
         name: "simple",
         code: indoc! {r#"
@@ -147,7 +182,6 @@ pub extern "C" fn derp() {
 fn benchmark_kind_display(c: &mut Criterion) {
     derp();
     downcase(&mut Ok(Value::Null), &mut Ok(Value::Null));
-    string(&mut Ok(Value::Null), &mut Ok(Value::Null));
     unsafe { vrl_fn_uuid_v4(&mut Ok(Value::Null)) };
     unsafe { vrl_fn_upcase(&mut Ok(Value::Null), &mut Ok(Value::Null)) };
     upcase(&mut Ok(Value::Null), &mut Ok(Value::Null));

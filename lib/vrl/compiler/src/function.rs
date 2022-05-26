@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     collections::{BTreeMap, HashMap},
     fmt,
 };
@@ -74,7 +75,7 @@ pub trait Function: Send + Sync + fmt::Debug {
         _ctx: &mut FunctionCompileContext,
         _name: &str,
         _expr: Option<&Expr>,
-    ) -> Result<Option<Box<dyn std::any::Any + Send + Sync>>, Box<dyn DiagnosticError>> {
+    ) -> Result<Option<Box<dyn Any + Send + Sync>>, Box<dyn DiagnosticError>> {
         Ok(None)
     }
 
