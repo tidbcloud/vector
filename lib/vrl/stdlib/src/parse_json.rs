@@ -111,6 +111,18 @@ impl Expression for ParseJsonFn {
     }
 }
 
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn vrl_fn_parse_json(value: &mut Value, resolved: &mut Resolved) {
+    let value = {
+        let mut moved = Value::Null;
+        std::mem::swap(value, &mut moved);
+        moved
+    };
+
+    *resolved = parse_json(value);
+}
+
 fn inner_kind() -> Kind {
     Kind::null()
         | Kind::bytes()
