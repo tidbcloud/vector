@@ -78,7 +78,6 @@ pub struct RequestMetadata {
     batch_size: usize,
     endpoint: DatadogTracesEndpoint,
     finalizers: EventFinalizers,
-    lang: Option<String>,
     uncompressed_size: usize,
 }
 
@@ -95,6 +94,7 @@ impl IncrementalRequestBuilder<(PartitionKey, Vec<Event>)> for DatadogTracesRequ
         let (key, events) = input;
         let mut results = Vec::new();
         let n = events.len();
+
         let traces_event = events
             .into_iter()
             .filter_map(|e| e.try_into_trace())
@@ -112,6 +112,7 @@ impl IncrementalRequestBuilder<(PartitionKey, Vec<Event>)> for DatadogTracesRequ
             .into_iter()
             .for_each(|r| match r {
                 Ok((payload, mut processed)) => {
+                    let uncompressed_size = payload.len();
                     let metadata = RequestMetadata {
                         api_key: key
                             .api_key
@@ -120,6 +121,7 @@ impl IncrementalRequestBuilder<(PartitionKey, Vec<Event>)> for DatadogTracesRequ
                         batch_size: n,
                         endpoint: DatadogTracesEndpoint::Traces,
                         finalizers: processed.take_finalizers(),
+                        uncompressed_size,
                     };
                     let mut compressor = Compressor::from(self.compression);
                     match compressor.write_all(&payload) {
@@ -129,9 +131,14 @@ impl IncrementalRequestBuilder<(PartitionKey, Vec<Event>)> for DatadogTracesRequ
                             reason: e.to_string(),
                             dropped_events: n as u64,
                         })),
-                    })
-            }
-        }
+                    }
+                }
+                Err(err) => results.push(Err(RequestBuilderError::FailedToEncode {
+                    message: err.parts().0,
+                    reason: err.parts().1.into(),
+                    dropped_events: err.parts().2,
+                })),
+            });
         results
     }
 
@@ -142,10 +149,6 @@ impl IncrementalRequestBuilder<(PartitionKey, Vec<Event>)> for DatadogTracesRequ
             "application/x-protobuf".to_string(),
         );
         headers.insert("DD-API-KEY".to_string(), metadata.api_key.to_string());
-        headers.insert(
-            "X-Datadog-Reported-Languages".to_string(),
-            metadata.lang.unwrap_or_else(|| "".into()),
-        );
         if let Some(ce) = self.compression.content_encoding() {
             headers.insert("Content-Encoding".to_string(), ce.to_string());
         }
@@ -185,6 +188,7 @@ impl EncoderError {
         }
     }
 }
+
 impl DatadogTracesEncoder {
     fn encode_trace(
         &self,
@@ -217,39 +221,32 @@ impl DatadogTracesEncoder {
         encoded_payloads
     }
 
-    fn trace_into_payload(key: &PartitionKey, events: &[TraceEvent]) -> dd_proto::TracePayload {
-        let mut traces: Vec<dd_proto::ApiTrace> = Vec::new();
-        let mut transactions: Vec<dd_proto::Span> = Vec::new();
-        for e in events.iter() {
-            if e.contains("spans") {
-                trace!("Encoding a trace.");
-                traces.push(DatadogTracesEncoder::vector_trace_into_dd_trace(e));
-            } else {
-                trace!("Encoding an APM event.");
-                transactions.push(DatadogTracesEncoder::convert_span(e.as_map()));
-            }
-        }
-        dd_proto::TracePayload {
+    fn trace_into_payload(key: &PartitionKey, events: &[TraceEvent]) -> dd_proto::AgentPayload {
+        dd_proto::AgentPayload {
             host_name: key.hostname.clone().unwrap_or_else(|| "".to_string()),
             env: key.env.clone().unwrap_or_else(|| "".into()),
-            traces,
-            transactions,
+            tracer_payloads: events
+                .iter()
+                .map(DatadogTracesEncoder::vector_trace_into_dd_tracer_payload)
+                .collect(),
+            // We only send tags at the Trace level
+            tags: BTreeMap::new(),
+            agent_version: key.agent_version.clone().unwrap_or_else(|| "".into()),
+            target_tps: key.target_tps.map(|tps| tps as f64).unwrap_or(0f64),
+            error_tps: key.error_tps.map(|tps| tps as f64).unwrap_or(0f64),
         }
     }
 
-    fn vector_trace_into_dd_trace(trace: &TraceEvent) -> dd_proto::ApiTrace {
-        let trace_id = match trace.get("trace_id") {
-            Some(Value::Integer(val)) => *val,
-            _ => 0,
-        };
-        let start_time = match trace.get("start_time") {
-            Some(Value::Timestamp(val)) => val.timestamp_nanos(),
-            _ => 0,
-        };
-        let end_time = match trace.get("end_time") {
-            Some(Value::Timestamp(val)) => val.timestamp_nanos(),
-            _ => 0,
-        };
+    fn vector_trace_into_dd_tracer_payload(trace: &TraceEvent) -> dd_proto::TracerPayload {
+        let tags = trace
+            .get("tags")
+            .and_then(|m| m.as_object())
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.to_string_lossy()))
+                    .collect::<BTreeMap<String, String>>()
+            })
+            .unwrap_or_else(BTreeMap::new);
 
         let spans = match trace.get("spans") {
             Some(Value::Array(v)) => v
@@ -259,11 +256,49 @@ impl DatadogTracesEncoder {
             _ => vec![],
         };
 
-        dd_proto::ApiTrace {
-            trace_id: trace_id as u64,
+        let chunk = dd_proto::TraceChunk {
+            priority: trace
+                .get("priority")
+                .and_then(|v| v.as_integer().map(|v| v as i32))
+                .unwrap_or(1i32),
+            origin: trace
+                .get("origin")
+                .map(|v| v.to_string_lossy())
+                .unwrap_or_else(|| "".into()),
+            dropped_trace: trace
+                .get("dropped")
+                .and_then(|v| v.as_boolean())
+                .unwrap_or(false),
             spans,
-            start_time,
-            end_time,
+            tags,
+        };
+
+        dd_proto::TracerPayload {
+            container_id: trace
+                .get("container_id")
+                .map(|v| v.to_string_lossy())
+                .unwrap_or_else(|| "".into()),
+            language_name: trace
+                .get("language_name")
+                .map(|v| v.to_string_lossy())
+                .unwrap_or_else(|| "".into()),
+            language_version: trace
+                .get("language_version")
+                .map(|v| v.to_string_lossy())
+                .unwrap_or_else(|| "".into()),
+            tracer_version: trace
+                .get("tracer_version")
+                .map(|v| v.to_string_lossy())
+                .unwrap_or_else(|| "".into()),
+            runtime_id: trace
+                .get("runtime_id")
+                .map(|v| v.to_string_lossy())
+                .unwrap_or_else(|| "".into()),
+            chunks: vec![chunk],
+            app_version: trace
+                .get("app_version")
+                .map(|v| v.to_string_lossy())
+                .unwrap_or_else(|| "".into()),
         }
     }
 
@@ -295,8 +330,7 @@ impl DatadogTracesEncoder {
 
         let meta = span
             .get("meta")
-            .map(|m| m.as_object())
-            .flatten()
+            .and_then(|m| m.as_object())
             .map(|m| {
                 m.iter()
                     .map(|(k, v)| (k.clone(), v.to_string_lossy()))
@@ -304,10 +338,19 @@ impl DatadogTracesEncoder {
             })
             .unwrap_or_else(BTreeMap::new);
 
+        let meta_struct = span
+            .get("meta_struct")
+            .and_then(|m| m.as_object())
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.coerce_to_bytes().into_iter().collect()))
+                    .collect::<BTreeMap<String, Vec<u8>>>()
+            })
+            .unwrap_or_else(BTreeMap::new);
+
         let metrics = span
             .get("metrics")
-            .map(|m| m.as_object())
-            .flatten()
+            .and_then(|m| m.as_object())
             .map(|m| {
                 m.iter()
                     .filter_map(|(k, v)| {
@@ -346,6 +389,7 @@ impl DatadogTracesEncoder {
             duration,
             meta,
             metrics,
+            meta_struct,
         }
     }
 }
