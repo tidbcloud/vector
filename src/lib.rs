@@ -143,17 +143,6 @@ pub mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }
 
-pub fn get_hostname() -> std::io::Result<String> {
-    if let Some(given) = std::env::var("VECTOR_HOSTNAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        Ok(given)
-    } else {
-        Ok(hostname::get()?.to_string_lossy().into())
-    }
-}
-
 #[track_caller]
 pub(crate) fn spawn_named<T>(
     task: impl std::future::Future<Output = T> + Send + 'static,

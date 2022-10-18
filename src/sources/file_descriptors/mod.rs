@@ -45,7 +45,7 @@ pub trait FileDescriptorConfig: NamedComponent {
         let host_key = self
             .host_key()
             .unwrap_or_else(|| log_schema().host_key().to_string());
-        let hostname = crate::get_hostname().ok();
+        let hostname = vector_common::get_hostname().ok();
 
         let source_type = Bytes::from_static(Self::NAME.as_bytes());
         let description = self.description();

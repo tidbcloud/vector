@@ -75,7 +75,7 @@ async fn run(
     mut out: SourceSender,
     shutdown: ShutdownSignal,
 ) -> Result<(), ()> {
-    let hostname = crate::get_hostname();
+    let hostname = vector_common::get_hostname();
     let pid = std::process::id();
 
     // Chain any log events that were captured during early buffering to the front,

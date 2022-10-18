@@ -163,10 +163,6 @@ const fn default_include_stderr() -> bool {
     true
 }
 
-fn get_hostname() -> Option<String> {
-    crate::get_hostname().ok()
-}
-
 const STDOUT: &str = "stdout";
 const STDERR: &str = "stderr";
 const STREAM_KEY: &str = "stream";
@@ -216,7 +212,7 @@ impl ExecConfig {
 impl SourceConfig for ExecConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         self.validate()?;
-        let hostname = get_hostname();
+        let hostname = vector_common::get_hostname().ok();
 
         let framing = self
             .framing

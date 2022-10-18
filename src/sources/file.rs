@@ -417,7 +417,7 @@ pub fn file_source(
             .host_key
             .clone()
             .unwrap_or_else(|| log_schema().host_key().to_string()),
-        hostname: crate::get_hostname().ok(),
+        hostname: vector_common::get_hostname().ok(),
         file_key: config.file_key.clone(),
         offset_key: config.offset_key.clone(),
     };
